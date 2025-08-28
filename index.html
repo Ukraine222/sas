@@ -1,0 +1,263 @@
+// Шашки — React SPA (App.jsx)
+// Полный однофайловый прототип игрового сайта "Шашки" с P2P (PeerJS), магазином скинов, адаптивным интерфейсом и аккуратной версткой.
+// Инструкции:
+// 1) Создайте проект Vite/CRA с React и Tailwind (или подключите Tailwind в любом удобном виде).
+// 2) Установите зависимости: peerjs (npm i peerjs).
+// 3) Поместите этот файл как src/App.jsx, подключите Tailwind и запустите.
+// 4) Для P2P в продакшене рекомендую поднять свой Peer сервер; для тестов подойдёт публичный.
+
+import React, { useEffect, useRef, useState } from 'react';
+import Peer from 'peerjs';
+
+// ====== Конфигурация скинов и визуала ======
+const SKINS = [
+  { id: 'classic', name: 'Классические', price: 0, css: { background: 'radial-gradient(circle at 30% 30%, #f7ecd0, #d7bfa6)' }, desc: 'Дерево — тёплые тона.' },
+  { id: 'floral', name: 'Цветочный', price: 80, css: { background: 'linear-gradient(135deg,#fff0f0,#ffe6e6)' }, desc: 'Нежный узор цветов.' },
+  { id: 'neo', name: 'Неон', price: 150, css: { background: 'linear-gradient(45deg,#7efff5,#5b7dff)' }, desc: 'Яркие контрастные цвета.' },
+  { id: 'ornament', name: 'Орнамент', price: 200, css: { background: 'linear-gradient(90deg,#fff1e6,#ffd6a5)' }, desc: 'Изысканный орнамент.' }
+];
+
+// ====== Утилиты ======
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function initialBoard(){
+  const board = Array(8).fill(0).map(()=>Array(8).fill(null));
+  for(let r=0;r<3;r++) for(let c=0;c<8;c++) if((r+c)%2===1) board[r][c] = { color:'black', king:false };
+  for(let r=5;r<8;r++) for(let c=0;c<8;c++) if((r+c)%2===1) board[r][c] = { color:'white', king:false };
+  return board;
+}
+function cloneBoard(b){ return b.map(row=>row.map(cell=>cell?{...cell}:null)); }
+function within(n){ return n>=0 && n<8; }
+
+function getMoves(board, r, c){
+  const piece = board[r][c]; if(!piece) return [];
+  const dirs = piece.king ? [[1,1],[1,-1],[-1,1],[-1,-1]] : (piece.color==='white'? [[-1,-1],[-1,1]]:[[1,-1],[1,1]]);
+  const moves = [];
+  for(const [dr,dc] of dirs){
+    const nr=r+dr, nc=c+dc;
+    if(within(nr) && within(nc) && !board[nr][nc]) moves.push({to:[nr,nc], capture:null});
+    const jr=r+2*dr, jc=c+2*dc, mr=r+dr, mc=c+dc;
+    if(within(jr) && within(jc) && board[mr][mc] && board[mr][mc].color !== piece.color && !board[jr][jc]) moves.push({to:[jr,jc], capture:[mr,mc]});
+  }
+  return moves;
+}
+
+function applyMove(board, from, to){
+  const b = cloneBoard(board);
+  const piece = b[from[0]][from[1]]; if(!piece) return b;
+  b[from[0]][from[1]] = null;
+  if(Math.abs(to[0]-from[0])===2){ const mr=(from[0]+to[0])/2, mc=(from[1]+to[1])/2; b[mr][mc] = null; }
+  b[to[0]][to[1]] = {...piece};
+  if(!piece.king){ if(piece.color==='white' && to[0]===0) b[to[0]][to[1]].king=true; if(piece.color==='black' && to[0]===7) b[to[0]][to[1]].king=true; }
+  return b;
+}
+
+// ====== Главный компонент App ======
+export default function App(){
+  // Метаданные раннего показа сайта
+  useEffect(()=>{ document.title = 'Шашки онлайн — играйте с другом'; },[]);
+
+  const [board, setBoard] = useState(()=>initialBoard());
+  const [selected, setSelected] = useState(null);
+  const [moves, setMoves] = useState([]);
+  const [turn, setTurn] = useState('white');
+  const [me, setMe] = useState({ role: 'host', symbol: null }); // role: host|guest
+  const [peerId, setPeerId] = useState('');
+  const [connId, setConnId] = useState('');
+  const [status, setStatus] = useState('Инициализация...');
+  const [coins, setCoins] = useState(500);
+  const [ownedSkins, setOwnedSkins] = useState(new Set(['classic']));
+  const [activeSkin, setActiveSkin] = useState('classic');
+  const peerRef = useRef(null);
+  const connRef = useRef(null);
+
+  // Инициализация Peer
+  useEffect(()=>{
+    const peer = new Peer(undefined, { debug: 0 });
+    peerRef.current = peer;
+    peer.on('open', id => { setPeerId(id); setStatus('Готово — создайте комнату или присоединитесь'); });
+    peer.on('connection', c => {
+      connRef.current = c; setupConn(c); setMe(prev=>({...prev, role:'host', symbol:'white'}));
+      setStatus('Игрок подключился. Игра начнётся.');
+    });
+    peer.on('error', err => setStatus('Peer ошибка: '+String(err)));
+    return ()=>{ try{peer.destroy();}catch{} }
+  },[]);
+
+  function setupConn(c){
+    c.on('open', ()=> setStatus('Соединение открыто'));
+    c.on('data', d => handleRemote(d));
+    c.on('close', ()=> setStatus('Соединение закрыто'));
+  }
+
+  function handleRemote(msg){
+    if(!msg || !msg.type) return;
+    if(msg.type==='state'){ const s = msg.payload; setBoard(s.board); setTurn(s.turn); }
+    if(msg.type==='move'){ const { from, to } = msg.payload; setBoard(b=>applyMove(b, from, to)); setTurn(t=>t==='white'?'black':'white'); }
+    if(msg.type==='chat'){ /* можно расширить */ }
+  }
+
+  function broadcast(msg){ if(connRef.current && connRef.current.open) connRef.current.send(msg); }
+
+  function createRoom(){ setMe({ role:'host', symbol:'white' }); setStatus('Комната создана — ждём игрока'); }
+
+  function joinRoom(id){ const c = peerRef.current.connect(id); connRef.current = c; setupConn(c); setMe({ role:'guest', symbol:'black' }); setStatus('Присоединён — ждём синхронизации'); }
+
+  // Клик по клетке
+  function onCellClick(r,c){
+    const piece = board[r][c];
+    if(selected){
+      // пытаться совершить ход
+      const mv = moves.find(m => m.to[0]===r && m.to[1]===c);
+      if(mv){
+        const from = selected; const to = [r,c];
+        const newBoard = applyMove(board, from, to);
+        setBoard(newBoard);
+        setSelected(null); setMoves([]);
+        setTurn(t=>t==='white'?'black':'white');
+        broadcast({ type:'move', payload:{ from, to } });
+        broadcast({ type:'state', payload:{ board:newBoard, turn: turn==='white'?'black':'white' } });
+      } else { setSelected(null); setMoves([]); }
+      return;
+    }
+    if(piece && piece.color===turn){ // выбрать
+      setSelected([r,c]); setMoves(getMoves(board,r,c));
+    }
+  }
+
+  // Магазин скинов
+  function buySkin(id){ const skin = SKINS.find(s=>s.id===id); if(!skin) return; if(ownedSkins.has(id)) return; if(coins < skin.price) return alert('Не хватает монет'); setCoins(c=>c-skin.price); setOwnedSkins(s=>new Set([...s,id])); }
+  function equipSkin(id){ if(!ownedSkins.has(id)) return alert('Скин не куплен'); setActiveSkin(id); }
+
+  // Сброс
+  function reset(){ setBoard(initialBoard()); setTurn('white'); broadcast({ type:'state', payload: { board: initialBoard(), turn: 'white' } }); }
+
+  // Отображение шашки
+  function Piece({cell}){
+    const style = { width:'78%', height:'78%', borderRadius:999, display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 6px 0 rgba(0,0,0,0.07) inset, 0 6px 14px rgba(0,0,0,0.12)' };
+    const skin = SKINS.find(s=>s.id===activeSkin) || SKINS[0];
+    return (
+      <div style={{...style, background: skin.css.background, border: cell.color==='white' ? '2px solid rgba(255,255,255,0.7)' : '2px solid rgba(0,0,0,0.2)'}}>
+        {cell.king && <span style={{fontSize:12, color: cell.color==='white'?'#111':'#fff'}}>♔</span>}
+      </div>
+    );
+  }
+
+  // UI: аккуратные стили, ограничение переполнения текста
+  const boardStyle = { width:'min(680px, 92vw)', aspectRatio:'1/1', display:'grid', gridTemplateColumns:'repeat(8, 1fr)', gap:6, padding:8, borderRadius:16, background:`${boardBackground()}`, boxShadow:'0 10px 30px rgba(2,6,23,0.08)'};
+
+  function boardBackground(){
+    // фон доски как изображение с сеткой и текстурой
+    return `linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.02)), repeating-linear-gradient(45deg, rgba(0,0,0,0.02) 0 10px, transparent 10px 20px)`;
+  }
+
+  return (
+    <div style={{minHeight:'100vh', padding:'24px', boxSizing:'border-box', fontFamily:'Inter, system-ui, -apple-system, Roboto, "Helvetica Neue", Arial'}}>
+      <div style={{maxWidth:1200, margin:'0 auto', display:'flex', gap:20, alignItems:'flex-start', flexWrap:'wrap'}}>
+        <div style={{flex:'1 1 680px', minWidth:320}}>
+          <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12}}>
+            <h1 style={{fontSize:20, margin:0, lineHeight:1.1}}>Шашки онлайн</h1>
+            <a href="https://gptonline.ai/" target="_blank" rel="noreferrer" style={{fontSize:12, color:'#6b7280', textDecoration:'none'}}>gptonline.ai</a>
+          </div>
+
+          <div style={{display:'flex', gap:12, marginBottom:12, alignItems:'center'}}>
+            <div style={{padding:10, borderRadius:10, background:'#fff', boxShadow:'0 6px 18px rgba(0,0,0,0.04)'}}>
+              <div style={{fontSize:12, color:'#6b7280', marginBottom:6}}>Ваш peer ID</div>
+              <div style={{fontFamily:'monospace', fontSize:13, wordBreak:'break-all', maxWidth:240}}>{peerId || '—'}</div>
+            </div>
+
+            <div style={{display:'flex', gap:8}}>
+              <button onClick={createRoom} style={btnStyle}>Создать комнату</button>
+              <input value={connId} onChange={e=>setConnId(e.target.value)} placeholder='ID комнаты' style={{padding:'10px 12px', borderRadius:10, border:'1px solid #e5e7eb', minWidth:160}} />
+              <button onClick={()=>joinRoom(connId)} style={btnStyle}>Подключиться</button>
+            </div>
+          </div>
+
+          <div style={{display:'flex', gap:12, alignItems:'center', marginBottom:12}}>
+            <div style={{padding:12, borderRadius:12, background:'#fff', flex:'0 0 auto'}}>
+              <div style={{fontSize:12,color:'#6b7280'}}>Статус</div>
+              <div style={{fontSize:14, fontWeight:600}}>{status}</div>
+            </div>
+            <div style={{padding:12, borderRadius:12, background:'#fff', flex:'1 1 auto'}}>
+              <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                <div style={{fontSize:12, color:'#6b7280'}}>Монеты</div>
+                <div style={{fontSize:16, fontWeight:700}}>{coins}</div>
+              </div>
+            </div>
+            <div style={{padding:12, borderRadius:12, background:'#fff'}}>
+              <div style={{fontSize:12, color:'#6b7280'}}>Ход</div>
+              <div style={{fontSize:14, fontWeight:600, textTransform:'capitalize'}}>{turn}</div>
+            </div>
+          </div>
+
+          <div style={{background:'#f8fafc', padding:12, borderRadius:14}}>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8}}>
+              <div style={{fontWeight:700}}>Игровая доска</div>
+              <div style={{display:'flex', gap:8}}>
+                <button onClick={reset} style={btnStyle}>Сбросить</button>
+              </div>
+            </div>
+
+            <div style={{overflow:'hidden', borderRadius:12, padding:10, background:'#fff'}}>
+              {/* actual board */}
+              <div style={{display:'grid', gridTemplateColumns:'repeat(8,1fr)', gap:6}}>
+                {board.map((row,r)=> row.map((cell,c)=>{
+                  const dark = (r+c)%2===1;
+                  const isSelected = selected && selected[0]===r && selected[1]===c;
+                  const canMove = moves.some(m=>m.to[0]===r && m.to[1]===c);
+                  return (
+                    <div key={`${r}-${c}`} onClick={()=>onCellClick(r,c)}
+                      style={{aspectRatio:'1/1', width:'100%', minWidth:36, borderRadius:8, cursor:dark? 'pointer' : 'default', display:'flex', alignItems:'center', justifyContent:'center', background: dark? '#b87d4a' : '#f3dcc1', boxShadow: isSelected? '0 6px 18px rgba(0,0,0,0.12) inset' : 'none', position:'relative', overflow:'hidden'}}>
+                      {cell && <Piece cell={cell} />}
+                      {canMove && <div style={{position:'absolute', width:18, height:18, borderRadius:999, background:'rgba(255,255,255,0.7)'}}></div>}
+                    </div>
+                  );
+                }))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <aside style={{width:360, minWidth:260}}>
+          <div style={{background:'#fff', padding:14, borderRadius:12, marginBottom:12}}>
+            <div style={{fontWeight:700, marginBottom:8}}>Магазин скинов</div>
+            <div style={{display:'grid', gap:10}}>
+              {SKINS.map(s=> (
+                <div key={s.id} style={{display:'flex', gap:10, alignItems:'center', justifyContent:'space-between'}}>
+                  <div style={{display:'flex', gap:10, alignItems:'center'}}>
+                    <div style={{width:56, height:44, borderRadius:8, background:s.css.background, border:'1px solid rgba(0,0,0,0.06)'}}></div>
+                    <div style={{minWidth:0}}>
+                      <div style={{fontWeight:600, fontSize:14, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{s.name}</div>
+                      <div style={{fontSize:12, color:'#6b7280', maxWidth:180, overflow:'hidden', textOverflow:'ellipsis'}}>{s.desc}</div>
+                    </div>
+                  </div>
+                  <div style={{display:'flex', gap:8, alignItems:'center'}}>
+                    <div style={{fontWeight:700}}>{s.price===0? 'Бесплатно': s.price}</div>
+                    {!ownedSkins.has(s.id) ? <button onClick={()=>buySkin(s.id)} style={btnStyle}>Купить</button> : <button onClick={()=>equipSkin(s.id)} style={{...btnStyle, background: activeSkin===s.id? '#4f46e5':'#111', color:'#fff'}}>{activeSkin===s.id? 'Надето' : 'Надеть'}</button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{background:'#fff', padding:14, borderRadius:12}}>
+            <div style={{fontWeight:700, marginBottom:8}}>Правила и бонусы</div>
+            <div style={{fontSize:13, color:'#374151', lineHeight:1.4}}>
+              • Игра идёт по упрощённым правилам русских шашек (диагональные ходы и прыжки).
+              <br/>• Покупки — локальные и имитируют внутриигровую экономику.
+              <br/>• Для продакшена — добавьте серверную валидацию и хранение прогресса.
+            </div>
+          </div>
+
+          <div style={{marginTop:12, background:'#fff', padding:12, borderRadius:12}}>
+            <div style={{fontSize:13, color:'#6b7280', fontWeight:700}}>Интеграция</div>
+            <div style={{fontSize:12, color:'#374151', marginTop:8}}>Разместите приложение на Vercel / Netlify / GitHub Pages. Для стабильности P2P рекомендуется собственный signaling server (PeerServer).</div>
+          </div>
+        </aside>
+      </div>
+
+      <footer style={{maxWidth:1200, margin:'28px auto 0', color:'#6b7280', fontSize:13, textAlign:'center'}}>Сделано аккуратно. Больше проектов и шаблонов — <a href="https://gptonline.ai/" target="_blank" rel="noreferrer">gptonline.ai</a></footer>
+    </div>
+  );
+}
+
+const btnStyle = { padding:'8px 12px', borderRadius:10, border:'none', background:'#111827', color:'#fff', cursor:'pointer' };
